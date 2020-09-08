@@ -1,88 +1,98 @@
+  
 #!/bin/bash
 
-set -e
+MONGODB_HOST=${MONGODB_PORT_27017_TCP_ADDR:-${MONGODB_HOST}}
+MONGODB_HOST=${MONGODB_PORT_1_27017_TCP_ADDR:-${MONGODB_HOST}}
+MONGODB_PORT=${MONGODB_PORT_27017_TCP_PORT:-${MONGODB_PORT}}
+MONGODB_PORT=${MONGODB_PORT_1_27017_TCP_PORT:-${MONGODB_PORT}}
+MONGODB_USER=${MONGODB_USER:-${MONGODB_ENV_MONGODB_USER}}
+MONGODB_PASSWORD=${MONGODB_PASSWORD:-${MONGODB_ENV_MONGODB_PASSWORD}}
 
-#
-# AWS configs
-#
-if [ -z "$AWS_ACCESS_KEY_ID" ]; then
-  echo "AWS_ACCESS_KEY_ID must be set"
-  exit 1
+S3PATH="minio/$BUCKET/$BACKUP_FOLDER"
+
+[[ ( -z "${MONGODB_USER}" ) && ( -n "${MONGODB_PASSWORD}" ) ]] && MONGODB_USER='admin'
+
+[[ ( -n "${MONGODB_USER}" ) ]] && USER_STR=" --username ${MONGODB_USER}"
+[[ ( -n "${MONGODB_PASSWORD}" ) ]] && PASS_STR=" --password ${MONGODB_PASSWORD}"
+[[ ( -n "${MONGODB_DATABASE}" ) ]] && DB_STR=" --db ${MONGODB_DATABASE}"
+
+
+nohup run-mongod
+
+# Export AWS Credentials into env file for cron job
+printenv | sed 's/^\([a-zA-Z0-9_]*\)=\(.*\)$/export \1="\2"/g' | grep -E "^export AWS" > /root/project_env.sh
+
+echo "=> Setting Alias"
+mc alias set minio http://minio:9000 $AWS_ACCESS_KEY_ID $AWS_SECRET_ACCESS_KEY
+
+echo "=> Creating backup script"
+rm -f /backup.sh
+cat <<EOF >> /backup.sh
+#!/bin/bash
+TIMESTAMP=\`/bin/date +"%Y%m%dT%H%M%S"\`
+BACKUP_NAME=\${TIMESTAMP}.dump.gz
+S3BACKUP=${S3PATH}\${BACKUP_NAME}
+S3LATEST=${S3PATH}latest.dump.gz
+echo "=> Backup started"
+if mongodump --host ${MONGODB_HOST} --port ${MONGODB_PORT} ${USER_STR}${PASS_STR}${DB_STR} --archive=\${BACKUP_NAME} --gzip ${EXTRA_OPTS} && mc cp \${BACKUP_NAME} \${S3BACKUP} && mc cp \${S3BACKUP} \${S3LATEST}  && rm \${BACKUP_NAME} ;then
+    echo "   > Backup succeeded"
+else
+    echo "   > Backup failed"
+fi
+echo "=> Done"
+EOF
+chmod +x /backup.sh
+echo "=> Backup script created"
+
+echo "=> Creating restore script"
+rm -f /restore.sh
+cat <<EOF >> /restore.sh
+#!/bin/bash
+if [[( -n "\${1}" )]];then
+    RESTORE_ME=\${1}.dump.gz
+else
+    RESTORE_ME=latest.dump.gz
+fi
+S3RESTORE=${S3PATH}\${RESTORE_ME}
+echo "=> Restore database from \${RESTORE_ME}"
+if mc cp \${S3RESTORE} \${RESTORE_ME}  && mongorestore --host ${MONGODB_HOST} --port ${MONGODB_PORT} ${USER_STR}${PASS_STR}${DB_STR} --drop --archive=\${RESTORE_ME} --gzip && rm \${RESTORE_ME}; then
+    echo "   Restore succeeded"
+else
+    echo "   Restore failed"
+fi
+echo "=> Done"
+EOF
+chmod +x /restore.sh
+echo "=> Restore script created"
+
+echo "=> Creating list script"
+rm -f /listbackups.sh
+cat <<EOF >> /listbackups.sh
+#!/bin/bash
+mc ls ${S3PATH}
+EOF
+chmod +x /listbackups.sh
+echo "=> List script created"
+
+ln -s /restore.sh /usr/bin/restore
+ln -s /backup.sh /usr/bin/backup
+ln -s /listbackups.sh /usr/bin/listbackups
+
+touch /mongo_backup.log
+
+if [ -n "${INIT_BACKUP}" ]; then
+    echo "=> Create a backup on the startup"
+    /backup.sh
 fi
 
-if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-  echo "AWS_SECRET_ACCESS_KEY must be set"
-  exit 1
+if [ -n "${INIT_RESTORE}" ]; then
+    echo "=> Restore store from lastest backup on startup"
+    /restore.sh
 fi
 
-if [ -z "$S3_BUCKET" ]; then
-  echo "S3_BUCKET must be set"
-  exit 1
-fi
-
-#
-# Mongo configs
-#
-if [ -z "$MONGO_HOST" ]; then
-  # default to a linked container with name "mongo"
-  MONGO_HOST="mongo"
-fi
-
-if [[ "$MONGO_DATABASE" ]]; then
-  MONGO_HOST+=" --db $MONGO_DATABASE"
-fi
-
-#
-# backup configs
-#
-if [ -z "$DATE_FORMAT" ]; then
-  DATE_FORMAT="%Y%m%d_%H%M%S"
-fi
-
-if [ -z "$FILE_PREFIX" ]; then
-  FILE_PREFIX=""
-fi
-
-function restore {
-  aws s3api get-object --bucket $S3_BUCKET --key $FILE /backup/$FILE
-  tar -zxvf /backup/$FILE -C /backup
-  mongorestore --drop --host $MONGO_HOST $MONGORESTORE_FLAGS dump/
-  rm -rf dump/ /backup/$FILE
-}
-
-# backup
-if [ "$1" == "backup" ]; then
-  printf "\nStarting backup...\n\n"
-
-  DATE=$(date +$DATE_FORMAT)
-  FILENAME=$FILE_PREFIX$DATE.tar.gz
-  FILE=/backup/$FILENAME
-
-  mongodump --host $MONGO_HOST $MONGODUMP_FLAGS
-  tar -zcvf $FILE dump/
-  printf "\nUploading $FILENAME...\n\n"
-  aws s3api put-object --bucket $S3_BUCKET --key $FILENAME --body $FILE
-  rm -rf dump/ $FILE
-
-# list backups
-elif [ "$1" == "list" ]; then
-  printf "\nRetrieving backups from $S3_BUCKET...\n\n"
-  aws s3api list-objects --bucket $S3_BUCKET --query 'Contents[].{Key: Key, Size: Size}' --output table
-
-# restore
-elif [ "$1" == "restore" ]; then
-  if [ -z "$2" ]; then
-    echo "Name of a dump to restore is required"
-    exit 1
-  fi
-  if [ "$2" == "latest" ]; then
-    printf "\nDetermining backup to restore...\n\n"
-    : ${FILE:=$(aws s3 ls s3://$S3_BUCKET | awk -F " " '{print $4}' | grep ^$FILE_PREFIX | sort -r | head -n1)}
-    printf "\nStarting restore of $FILE...\n"
-    restore
-  else
-    FILE=$2
-    printf "\nStarting restore of $FILE...\n\n"
-    restore
-  fi
+if [ -z "${DISABLE_CRON}" ]; then
+    echo "${CRON_TIME} . /root/project_env.sh; /backup.sh >> /mongo_backup.log 2>&1" > /crontab.conf
+    crontab  /crontab.conf
+    echo "=> Running cron job"
+    crontab && tail -f /mongo_backup.log
 fi

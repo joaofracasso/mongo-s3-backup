@@ -1,16 +1,14 @@
-FROM alpine:latest
+FROM centos/mongodb-36-centos7
 
-RUN apk update && \
-    apk add --no-cache bash mongodb-tools groff less python py-pip && \
-    pip install awscli && \
-    apk del --purge py-pip && \
-    rm /var/cache/apk/*
+# Install Python and Cron
+USER root
+RUN yum update -y && yum install cronie -y
+# Install Python and Cron
+COPY mc /bin
 
-RUN mkdir -p /backup/data
+ENV CRON_TIME="0 3 * * *" \
+  TZ=US/Eastern \
+  CRON_TZ=US/Eastern
 
-COPY run.sh /backup/run
-
-WORKDIR /backup
-
-ENTRYPOINT ["./run"]
-CMD ["backup"]
+ADD run.sh /run.sh
+CMD /run.sh
